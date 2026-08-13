@@ -401,7 +401,7 @@ func (h *NPMHandler) validateUpstreamTarballURL(tarball string) (string, error) 
 	}
 
 	basePath := strings.TrimSuffix(upstreamURL.Path, "/")
-	if basePath != "" && basePath != "/" {
+	if basePath != "" {
 		if tarballURL.Path != basePath && !strings.HasPrefix(tarballURL.Path, basePath+"/") {
 			return "", errors.New("npm tarball URL is outside upstream base path")
 		}
