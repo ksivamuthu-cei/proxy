@@ -9,12 +9,19 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/purl"
 )
 
 const (
 	npmUpstream      = "https://registry.npmjs.org"
 	npmAbbreviatedCT = "application/vnd.npm.install-v1+json"
 	scopedParts      = 2 // scope + name in scoped packages
+)
+
+var (
+	errNPMVersionMissing = errors.New("npm metadata has no requested version")
+	errNPMTarballMissing = errors.New("npm metadata version has no tarball")
 )
 
 // NPMHandler handles npm registry protocol requests.
@@ -286,14 +293,27 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	h.proxy.Logger.Info("npm download request",
 		"package", packageName, "version", version, "filename", filename)
 
+	pkgPURL := purl.MakePURLString("npm", packageName, "")
+	versionPURL := purl.MakePURLString("npm", packageName, version)
+	result, err := h.proxy.checkCache(r.Context(), pkgPURL, versionPURL, filename)
+	if err != nil {
+		h.proxy.Logger.Error("failed to get artifact", "error", err)
+		JSONError(w, http.StatusBadGateway, "failed to fetch package")
+		return
+	}
+	if result != nil {
+		ServeArtifact(w, result)
+		return
+	}
+
 	downloadURL, err := h.downloadURL(r, packageName, version, filename)
 	if err != nil {
 		h.proxy.Logger.Error("failed to resolve npm tarball URL", "error", err)
 		JSONError(w, http.StatusBadRequest, "invalid tarball request")
 		return
 	}
-	result, err := h.proxy.GetOrFetchArtifactFromURL(
-		r.Context(), "npm", packageName, version, filename, downloadURL,
+	result, err = h.proxy.fetchAndCacheFromURL(
+		r.Context(), "npm", packageName, version, filename, pkgPURL, versionPURL, downloadURL, nil,
 	)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
@@ -319,6 +339,11 @@ func (h *NPMHandler) downloadURL(r *http.Request, packageName, version, filename
 
 	tarball, err := npmVersionTarball(body, version)
 	if err != nil {
+		if errors.Is(err, errNPMVersionMissing) || errors.Is(err, errNPMTarballMissing) {
+			h.proxy.Logger.Warn("npm metadata could not resolve tarball; using constructed URL",
+				"package", packageName, "version", version, "error", err)
+			return h.constructDownloadURL(packageName, filename), nil
+		}
 		return "", err
 	}
 
@@ -340,10 +365,10 @@ func npmVersionTarball(body []byte, version string) (string, error) {
 
 	versionData, ok := metadata.Versions[version]
 	if !ok {
-		return "", fmt.Errorf("npm metadata has no version %q", version)
+		return "", fmt.Errorf("%w %q", errNPMVersionMissing, version)
 	}
 	if versionData.Dist.Tarball == "" {
-		return "", fmt.Errorf("npm metadata version %q has no tarball", version)
+		return "", fmt.Errorf("%w %q", errNPMTarballMissing, version)
 	}
 
 	return versionData.Dist.Tarball, nil
@@ -371,6 +396,9 @@ func (h *NPMHandler) validateUpstreamTarballURL(tarball string) (string, error) 
 		!strings.EqualFold(tarballURL.Host, upstreamURL.Host) {
 		return "", errors.New("npm tarball URL does not match upstream registry")
 	}
+	if hasDotPathSegments(tarballURL.EscapedPath()) {
+		return "", errors.New("npm tarball URL contains traversal segments")
+	}
 
 	basePath := strings.TrimSuffix(upstreamURL.Path, "/")
 	if basePath != "" && basePath != "/" {
@@ -380,6 +408,28 @@ func (h *NPMHandler) validateUpstreamTarballURL(tarball string) (string, error) 
 	}
 
 	return tarballURL.String(), nil
+}
+
+func hasDotPathSegments(escapedPath string) bool {
+	for _, segment := range strings.Split(escapedPath, "/") {
+		if segment == "" {
+			continue
+		}
+
+		decoded, err := url.PathUnescape(segment)
+		if err != nil {
+			decoded = segment
+		}
+		for _, part := range strings.FieldsFunc(decoded, func(r rune) bool {
+			return r == '/' || r == '\\'
+		}) {
+			if part == "." || part == ".." {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func escapeNPMDownloadPackage(packageName string) string {
